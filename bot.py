@@ -6,6 +6,7 @@ from datetime import datetime
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
@@ -27,8 +28,6 @@ CREATORS = ["@n3xyx", "@rakuzsa", "@xuzoe"]
 SUPPORT_CONTACT = "@rakuzsa"
 
 # ============ PREMIUM EMOJI ============
-# Чтобы включить TG-премиум эмодзи: поставь USE_PREMIUM_EMOJI=1 в переменных,
-# и впиши ID эмодзи в PREMIUM_IDS (получить можно в @tg_emoji_bot).
 USE_PREMIUM = os.getenv("USE_PREMIUM_EMOJI", "0") == "1"
 PREMIUM_IDS = {
     # "fire": "5368324170671202286",
@@ -54,7 +53,9 @@ def e(key: str) -> str:
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN не задан!")
 
-bot = Bot(token=BOT_TOKEN, parse_mode="HTML")
+# ИСПРАВЛЕНИЕ ОШИБКИ RAILWAY ЗДЕСЬ:
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
