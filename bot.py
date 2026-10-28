@@ -1,11 +1,13 @@
 import asyncio
 import logging
 import os
+import traceback
 from html import escape
 from datetime import datetime
+from typing import Any, Awaitable, Callable, Dict
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
@@ -13,10 +15,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, TelegramObject,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("gdz_bot")
 
 # ============ CONFIG ============
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -27,12 +33,9 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 CREATORS = ["@n3xyx", "@rakuzsa", "@xuzoe"]
 SUPPORT_CONTACT = "@rakuzsa"
 
-# ============ PREMIUM EMOJI ============
+# ============ EMOJI ============
 USE_PREMIUM = os.getenv("USE_PREMIUM_EMOJI", "0") == "1"
-PREMIUM_IDS = {
-    # "fire": "5368324170671202286",
-    # "robot": "5368324170671202286",
-}
+PREMIUM_IDS: dict[str, str] = {}
 EMOJI = {
     "robot": "🤖", "book": "📚", "calendar": "📅", "support": "💬",
     "users": "👥", "profile": "👤", "admin": "⚙️", "fire": "🔥",
@@ -53,12 +56,39 @@ def e(key: str) -> str:
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN не задан!")
 
-# ИСПРАВЛЕНИЕ ОШИБКИ RAILWAY ЗДЕСЬ:
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-
 dp = Dispatcher(storage=MemoryStorage())
 router = Router()
 dp.include_router(router)
+
+# ============ MIDDLEWARE: ловит ошибки и гарантирует ответ на callback ============
+class SafetyMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        if isinstance(event, CallbackQuery):
+            log.info(f"CB from {event.from_user.id}: {event.data!r}")
+        try:
+            return await handler(event, data)
+        except Exception as ex:
+            log.error(f"HANDLER ERROR: {type(ex).__name__}: {ex}\n{traceback.format_exc()}")
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer("⚠️ Ошибка. Попробуй ещё раз.", show_alert=True)
+                except Exception:
+                    pass
+            elif isinstance(event, Message):
+                try:
+                    await event.answer("⚠️ Ошибка. Попробуй ещё раз.")
+                except Exception:
+                    pass
+            return None
+
+dp.message.middleware(SafetyMiddleware())
+dp.callback_query.middleware(SafetyMiddleware())
 
 # ============ FSM ============
 class ModelStates(StatesGroup):
@@ -87,13 +117,10 @@ class UserMsgStates(StatesGroup):
     text = State()
 
 # ============ DB ============
-async def db_connect():
-    db = await aiosqlite.connect(DB_PATH)
-    db.row_factory = aiosqlite.Row
-    return db
-
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA busy_timeout=5000")
         await db.executescript("""
         CREATE TABLE IF NOT EXISTS users (
             tg_id INTEGER PRIMARY KEY,
@@ -127,12 +154,9 @@ async def init_db():
         """)
         await db.commit()
 
-# ============ HELPERS ============
-def is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
-
 async def get_user(uid: int):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM users WHERE tg_id=?", (uid,))
         return await cur.fetchone()
 
@@ -140,13 +164,17 @@ async def register_user(user):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (tg_id, username, full_name, registered_at) VALUES (?,?,?,?)",
-            (user.id, user.username or "", user.full_name or "", datetime.now().isoformat())
+            (user.id, user.username or "", user.full_name or "", datetime.now().isoformat()),
         )
         await db.execute(
             "UPDATE users SET username=?, full_name=? WHERE tg_id=?",
-            (user.username or "", user.full_name or "", user.id)
+            (user.username or "", user.full_name or "", user.id),
         )
         await db.commit()
+
+# ============ HELPERS ============
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
 async def safe_edit(call: CallbackQuery, text: str, kb=None):
     try:
@@ -154,15 +182,21 @@ async def safe_edit(call: CallbackQuery, text: str, kb=None):
     except TelegramBadRequest as ex:
         if "message is not modified" in str(ex):
             return
-        try: await call.message.answer(text, reply_markup=kb)
-        except Exception: pass
+        try:
+            await call.message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
     except Exception:
-        try: await call.message.answer(text, reply_markup=kb)
-        except Exception: pass
+        try:
+            await call.message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
 
 async def safe_send(chat_id: int, text: str, kb=None):
-    try: await bot.send_message(chat_id, text, reply_markup=kb)
-    except Exception as ex: logging.warning(f"send failed to {chat_id}: {ex}")
+    try:
+        await bot.send_message(chat_id, text, reply_markup=kb)
+    except Exception as ex:
+        log.warning(f"send failed to {chat_id}: {ex}")
 
 def back_btn(data="main_menu"):
     return InlineKeyboardButton(text=f"{e('back')} Назад", callback_data=data)
@@ -197,7 +231,7 @@ async def show_main(target, edit=False):
         m = target.message if isinstance(target, CallbackQuery) else target
         await m.answer(text, reply_markup=kb)
 
-# ============ START ============
+# ============ START / HELP / TEST ============
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
@@ -205,9 +239,20 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(
         f"{e('rocket')} <b>Добро пожаловать в ГДЗ Бот!</b>\n\n"
         f"Здесь ты найдёшь готовые домашние задания и расписание ДЗ.\n\n"
-        f"{e('info')} Для начала выбери модель ИИ — это нужно для корректной выдачи ГДЗ.",
-        reply_markup=main_menu_kb(is_admin(message.from_user.id), False)
+        f"{e('info')} Для начала выбери модель ИИ.",
+        reply_markup=main_menu_kb(is_admin(message.from_user.id), False),
     )
+
+@router.message(Command("test"))
+async def cmd_test(message: Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Проверить кнопки", callback_data="test_ping")]
+    ])
+    await message.answer("Тест кнопок:", reply_markup=kb)
+
+@router.callback_query(F.data == "test_ping")
+async def cb_test(call: CallbackQuery):
+    await call.answer("✅ Кнопки работают!", show_alert=True)
 
 @router.callback_query(F.data == "main_menu")
 async def cb_main(call: CallbackQuery, state: FSMContext):
@@ -215,14 +260,15 @@ async def cb_main(call: CallbackQuery, state: FSMContext):
     await show_main(call, edit=True)
     await call.answer()
 
-# ============ USER: MODEL SELECT ============
+# ============ MODELS (user) ============
 @router.callback_query(F.data == "models_list")
 async def cb_models_list(call: CallbackQuery):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM models ORDER BY is_recommended DESC, name")
         models = await cur.fetchall()
     if not models:
-        await safe_edit(call, f"{e('warning')} Пока нет доступных моделей ИИ. Попробуй позже.",
+        await safe_edit(call, f"{e('warning')} Пока нет доступных моделей ИИ.",
                         InlineKeyboardMarkup(inline_keyboard=[[back_btn()]]))
         await call.answer(); return
     kb = []
@@ -238,7 +284,8 @@ async def cb_models_list(call: CallbackQuery):
 @router.callback_query(F.data.startswith("pick_model_"))
 async def cb_pick_model(call: CallbackQuery):
     mid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM models WHERE id=?", (mid,))
         m = await cur.fetchone()
         if not m:
@@ -248,10 +295,11 @@ async def cb_pick_model(call: CallbackQuery):
     await call.answer(f"Модель {m['name']} выбрана ✅", show_alert=True)
     await show_main(call, edit=True)
 
-# ============ USER: ДЗ ============
+# ============ ДЗ (user) ============
 @router.callback_query(F.data == "hw_menu")
 async def cb_hw_menu(call: CallbackQuery):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT id, date_str, month_str, week_str FROM homework ORDER BY id DESC")
         rows = await cur.fetchall()
     if not rows:
@@ -269,12 +317,13 @@ async def cb_hw_menu(call: CallbackQuery):
 @router.callback_query(F.data.startswith("hw_view_"))
 async def cb_hw_view(call: CallbackQuery):
     hid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM homework WHERE id=?", (hid,))
         hw = await cur.fetchone()
     if not hw:
         await call.answer("Не найдено", show_alert=True); return
-    header = (f"{e('calendar')} <b>ДЗ на {hw['date_str']} · {hw['month_str']} · {hw['week_str']}</b>\n\n")
+    header = f"{e('calendar')} <b>ДЗ на {hw['date_str']} · {hw['month_str']} · {hw['week_str']}</b>\n\n"
     kb = InlineKeyboardMarkup(inline_keyboard=[[back_btn("hw_menu")]])
     if hw["content_photo"]:
         try:
@@ -288,7 +337,7 @@ async def cb_hw_view(call: CallbackQuery):
         await safe_edit(call, header + (hw["content_text"] or "—"), kb)
     await call.answer()
 
-# ============ USER: ГДЗ ============
+# ============ ГДЗ (user) ============
 @router.callback_query(F.data == "gdz_subjects")
 async def cb_gdz_subjects(call: CallbackQuery):
     user = await get_user(call.from_user.id)
@@ -298,7 +347,8 @@ async def cb_gdz_subjects(call: CallbackQuery):
                 [InlineKeyboardButton(text=f"{e('robot')} Выбрать модель", callback_data="models_list")],
                 [back_btn()]]))
         await call.answer(); return
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM subjects ORDER BY name")
         subjects = await cur.fetchall()
     if not subjects:
@@ -318,7 +368,8 @@ async def cb_gdz_subject(call: CallbackQuery):
     user = await get_user(call.from_user.id)
     if not user or not user["model_id"]:
         await call.answer("Сначала выбери модель ИИ!", show_alert=True); return
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM subjects WHERE id=?", (sid,))
         subj = await cur.fetchone()
         cur = await db.execute(
@@ -326,6 +377,8 @@ async def cb_gdz_subject(call: CallbackQuery):
             "WHERE subject_id=? AND model_id=? ORDER BY id DESC",
             (sid, user["model_id"]))
         rows = await cur.fetchall()
+    if not subj:
+        await call.answer("Не найдено", show_alert=True); return
     if not rows:
         await safe_edit(call,
             f"{e('warning')} По предмету <b>{subj['name']}</b> пока нет ГДЗ для выбранной модели.",
@@ -342,7 +395,8 @@ async def cb_gdz_subject(call: CallbackQuery):
 @router.callback_query(F.data.startswith("gdz_view_"))
 async def cb_gdz_view(call: CallbackQuery):
     gid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM gdz WHERE id=?", (gid,))
         g = await cur.fetchone()
     if not g:
@@ -362,47 +416,51 @@ async def cb_gdz_view(call: CallbackQuery):
         await safe_edit(call, header + (g["content_text"] or "—"), kb)
     await call.answer()
 
-# ============ SUPPORT ============
+# ============ SUPPORT / CREATORS / PROFILE ============
 @router.callback_query(F.data == "support")
 async def cb_support(call: CallbackQuery):
     user = call.from_user
     await safe_edit(call,
         f"{e('support')} <b>Поддержка</b>\n\n"
-        f"Если у тебя возникли вопросы или проблемы — напиши нам:\n"
-        f"👉 {SUPPORT_CONTACT}\n\n"
-        f"Мы постараемся ответить как можно скорее!",
+        f"Если у тебя возникли вопросы — напиши:\n"
+        f"👉 {SUPPORT_CONTACT}",
         InlineKeyboardMarkup(inline_keyboard=[[back_btn()]]))
     name = escape(user.full_name or "—")
     uname = f"@{user.username}" if user.username else name
-    note = (f"{e('bell')} <b>Пользователь выбрал раздел Поддержка</b>\n\n"
+    note = (f"{e('bell')} <b>Пользователь в разделе Поддержка</b>\n\n"
             f"{e('profile')} {name}\n"
             f"{e('id')} <code>{user.id}</code>\n"
             f"{e('info')} {uname}")
-    for aid in set(ADMIN_IDS + ([OWNER_ID] if OWNER_ID else [])):
-        if aid: await safe_send(aid, note)
+    targets = set(ADMIN_IDS)
+    if OWNER_ID:
+        targets.add(OWNER_ID)
+    for aid in targets:
+        if aid:
+            await safe_send(aid, note)
     await call.answer()
 
-# ============ CREATORS ============
 @router.callback_query(F.data == "creators")
 async def cb_creators(call: CallbackQuery):
     text = f"{e('crown')} <b>Создатели</b>\n\n"
-    for c in CREATORS: text += f"• {c}\n"
-    text += f"\n{e('sparkles')} Спасибо за использование нашего бота!"
+    for c in CREATORS:
+        text += f"• {c}\n"
+    text += f"\n{e('sparkles')} Спасибо, что пользуешься ботом!"
     await safe_edit(call, text, InlineKeyboardMarkup(inline_keyboard=[[back_btn()]]))
     await call.answer()
 
-# ============ PROFILE ============
 @router.callback_query(F.data == "profile")
 async def cb_profile(call: CallbackQuery):
     u = call.from_user
     user = await get_user(u.id)
     model_name = "не выбрана"
     if user and user["model_id"]:
-        async with await db_connect() as db:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT name FROM models WHERE id=?", (user["model_id"],))
             m = await cur.fetchone()
-            if m: model_name = m["name"]
-    reg = (user["registered_at"][:19] if user and user["registered_at"] else "—")
+            if m:
+                model_name = m["name"]
+    reg = user["registered_at"][:19] if user and user["registered_at"] else "—"
     text = (f"{e('profile')} <b>Профиль</b>\n\n"
             f"{e('id')} ID: <code>{u.id}</code>\n"
             f"{e('write')} Имя: <b>{escape(u.full_name or '—')}</b>\n"
@@ -445,8 +503,10 @@ async def cb_admin(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "adm_stats")
 async def cb_stats(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    async with await db_connect() as db:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         async def c(q):
             cur = await db.execute(q); return (await cur.fetchone())["c"]
         users = await c("SELECT COUNT(*) c FROM users")
@@ -468,9 +528,11 @@ USERS_PER_PAGE = 10
 
 @router.callback_query(F.data.startswith("adm_users_"))
 async def cb_users(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     page = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT COUNT(*) c FROM users")
         total = (await cur.fetchone())["c"]
         cur = await db.execute(
@@ -480,36 +542,43 @@ async def cb_users(call: CallbackQuery):
     kb = []
     for u in users:
         label = f"{u['full_name'] or 'User'} ({'@'+u['username'] if u['username'] else u['tg_id']})"
-        if len(label) > 45: label = label[:42] + "..."
+        if len(label) > 45:
+            label = label[:42] + "..."
         kb.append([InlineKeyboardButton(text=label, callback_data=f"adm_user_{u['tg_id']}")])
     nav = []
-    if page > 0: nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm_users_{page-1}"))
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"adm_users_{page-1}"))
     pages_total = max(1, (total - 1) // USERS_PER_PAGE + 1)
     nav.append(InlineKeyboardButton(text=f"{page+1}/{pages_total}", callback_data="noop"))
-    if (page+1) * USERS_PER_PAGE < total:
+    if (page + 1) * USERS_PER_PAGE < total:
         nav.append(InlineKeyboardButton(text="▶️", callback_data=f"adm_users_{page+1}"))
-    if nav: kb.append(nav)
+    if nav:
+        kb.append(nav)
     kb.append([back_btn("admin")])
     await safe_edit(call, f"{e('users')} <b>Пользователи</b> (всего: {total})",
                     InlineKeyboardMarkup(inline_keyboard=kb))
     await call.answer()
 
 @router.callback_query(F.data == "noop")
-async def cb_noop(call: CallbackQuery): await call.answer()
+async def cb_noop(call: CallbackQuery):
+    await call.answer()
 
 @router.callback_query(F.data.startswith("adm_user_"))
 async def cb_user_view(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     uid = int(call.data.split("_")[-1])
     user = await get_user(uid)
     if not user:
         await call.answer("Не найден", show_alert=True); return
     model_name = "—"
     if user["model_id"]:
-        async with await db_connect() as db:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
             cur = await db.execute("SELECT name FROM models WHERE id=?", (user["model_id"],))
             m = await cur.fetchone()
-            if m: model_name = m["name"]
+            if m:
+                model_name = m["name"]
     text = (f"{e('profile')} <b>Профиль пользователя</b>\n\n"
             f"{e('id')} ID: <code>{user['tg_id']}</code>\n"
             f"{e('write')} Имя: {escape(user['full_name'] or '—')}\n"
@@ -524,7 +593,8 @@ async def cb_user_view(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm_msg_"))
 async def cb_user_msg(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     uid = int(call.data.split("_")[-1])
     await state.set_state(UserMsgStates.text)
     await state.update_data(target=uid)
@@ -540,9 +610,8 @@ async def msg_to_user(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("Нужен текст."); return
     try:
-        await bot.send_message(uid,
-            f"{e('bell')} <b>Сообщение от администратора:</b>\n\n{message.text}")
-        await message.answer(f"{e('check')} Сообщение отправлено.",
+        await bot.send_message(uid, f"{e('bell')} <b>Сообщение от админа:</b>\n\n{message.text}")
+        await message.answer(f"{e('check')} Отправлено.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn(f"adm_user_{uid}")]]))
     except Exception as ex:
         await message.answer(f"{e('cross')} Не удалось: {ex}",
@@ -551,7 +620,8 @@ async def msg_to_user(message: Message, state: FSMContext):
 # ============ ADMIN: BROADCAST ============
 @router.callback_query(F.data == "adm_broadcast")
 async def cb_broadcast(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.set_state(BroadcastStates.text)
     await safe_edit(call, f"{e('megaphone')} <b>Рассылка</b>\n\nОтправь текст для всех пользователей:",
                     InlineKeyboardMarkup(inline_keyboard=[[back_btn("admin")]]))
@@ -560,10 +630,12 @@ async def cb_broadcast(call: CallbackQuery, state: FSMContext):
 @router.message(BroadcastStates.text)
 async def do_broadcast(message: Message, state: FSMContext):
     await state.clear()
-    if not is_admin(message.from_user.id): return
+    if not is_admin(message.from_user.id):
+        return
     if not message.text:
         await message.answer("Нужен текст."); return
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT tg_id FROM users")
         users = await cur.fetchall()
     msg = await message.answer(f"{e('clock')} Отправка... 0/{len(users)}")
@@ -572,16 +644,20 @@ async def do_broadcast(message: Message, state: FSMContext):
         try:
             await bot.send_message(u["tg_id"], f"{e('megaphone')} {message.text}")
             ok += 1
-        except Exception: pass
-        if (i+1) % 25 == 0:
-            try: await msg.edit_text(f"{e('clock')} Отправка... {i+1}/{len(users)}")
-            except Exception: pass
-    await msg.edit_text(f"{e('check')} <b>Рассылка завершена</b>\n\nОтправлено: {ok}/{len(users)}",
+        except Exception:
+            pass
+        if (i + 1) % 25 == 0:
+            try:
+                await msg.edit_text(f"{e('clock')} Отправка... {i+1}/{len(users)}")
+            except Exception:
+                pass
+    await msg.edit_text(f"{e('check')} <b>Готово</b>\nОтправлено: {ok}/{len(users)}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[back_btn("admin")]]))
 
 # ============ ADMIN: MODELS ============
 async def render_adm_models(call: CallbackQuery):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM models ORDER BY is_recommended DESC, name")
         models = await cur.fetchall()
     kb = []
@@ -596,14 +672,16 @@ async def render_adm_models(call: CallbackQuery):
 
 @router.callback_query(F.data == "adm_models")
 async def cb_adm_models(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.clear()
     await render_adm_models(call)
     await call.answer()
 
 @router.callback_query(F.data == "adm_model_add")
 async def cb_model_add(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.set_state(ModelStates.add_name)
     await safe_edit(call, f"{e('plus')} Введи название модели:",
                     InlineKeyboardMarkup(inline_keyboard=[[back_btn("adm_models")]]))
@@ -628,7 +706,8 @@ async def model_add_name(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("adm_model_rename_"))
 async def cb_model_rename(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     mid = int(call.data.split("_")[-1])
     await state.set_state(ModelStates.edit_name)
     await state.update_data(mid=mid)
@@ -640,7 +719,8 @@ async def cb_model_rename(call: CallbackQuery, state: FSMContext):
 async def model_rename(message: Message, state: FSMContext):
     if not message.text:
         await message.answer("Отправь текст."); return
-    data = await state.get_data(); mid = data["mid"]
+    data = await state.get_data()
+    mid = data.get("mid")
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("UPDATE models SET name=? WHERE id=?", (message.text.strip(), mid))
@@ -653,51 +733,60 @@ async def model_rename(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("adm_model_rec_"))
 async def cb_model_rec(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     mid = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute("SELECT is_recommended FROM models WHERE id=?", (mid,))
         r = await cur.fetchone()
-        new_val = 0 if r[0] else 1
-        await db.execute("UPDATE models SET is_recommended=? WHERE id=?", (new_val, mid))
-        await db.commit()
-    await cb_model_view(call)
+        if r:
+            new_val = 0 if r[0] else 1
+            await db.execute("UPDATE models SET is_recommended=? WHERE id=?", (new_val, mid))
+            await db.commit()
+    await cb_model_view(call, answer=False)
 
 @router.callback_query(F.data.startswith("adm_model_del_"))
 async def cb_model_del(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     mid = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM models WHERE id=?", (mid,))
         await db.execute("UPDATE users SET model_id=NULL WHERE model_id=?", (mid,))
         await db.commit()
-    await call.answer("Удалено", show_alert=True)
     await render_adm_models(call)
+    await call.answer("Удалено", show_alert=True)
 
 @router.callback_query(F.data.startswith("adm_model_"))
-async def cb_model_view(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    if call.data == "adm_model_add": return
+async def cb_model_view(call: CallbackQuery, answer: bool = True):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
+    if call.data == "adm_model_add":
+        return
     mid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM models WHERE id=?", (mid,))
         m = await cur.fetchone()
     if not m:
-        await call.answer("Не найдено", show_alert=True); return
+        if answer:
+            await call.answer("Не найдено", show_alert=True)
+        return
     rec_status = "включена" if m["is_recommended"] else "выключена"
-    text = (f"{e('robot')} <b>{m['name']}</b>\n\n"
-            f"{e('star')} Рекомендуем: {rec_status}")
+    text = f"{e('robot')} <b>{m['name']}</b>\n\n{e('star')} Рекомендуем: {rec_status}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"{e('edit')} Переименовать", callback_data=f"adm_model_rename_{mid}"),
          InlineKeyboardButton(text=f"{e('star')} Рекоменд.", callback_data=f"adm_model_rec_{mid}")],
         [InlineKeyboardButton(text=f"{e('trash')} Удалить", callback_data=f"adm_model_del_{mid}")],
         [back_btn("adm_models")]])
     await safe_edit(call, text, kb)
-    await call.answer()
+    if answer:
+        await call.answer()
 
 # ============ ADMIN: HOMEWORK ============
 async def render_adm_hw(call: CallbackQuery):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM homework ORDER BY id DESC")
         rows = await cur.fetchall()
     kb = []
@@ -711,14 +800,16 @@ async def render_adm_hw(call: CallbackQuery):
 
 @router.callback_query(F.data == "adm_hw")
 async def cb_adm_hw(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.clear()
     await render_adm_hw(call)
     await call.answer()
 
 @router.callback_query(F.data == "adm_hw_add")
 async def cb_hw_add(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.set_state(HWStates.add_date)
     await safe_edit(call, f"{e('calendar')} Введи дату (например: 12.05.2025):",
                     InlineKeyboardMarkup(inline_keyboard=[[back_btn("adm_hw")]]))
@@ -726,21 +817,24 @@ async def cb_hw_add(call: CallbackQuery, state: FSMContext):
 
 @router.message(HWStates.add_date)
 async def hw_add_date(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     await state.update_data(date_str=message.text.strip())
     await state.set_state(HWStates.add_month)
-    await message.answer(f"{e('calendar')} Введи месяц (например: Май):")
+    await message.answer(f"{e('calendar')} Введи месяц:")
 
 @router.message(HWStates.add_month)
 async def hw_add_month(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     await state.update_data(month_str=message.text.strip())
     await state.set_state(HWStates.add_week)
-    await message.answer(f"{e('calendar')} Введи неделю (например: 2 неделя):")
+    await message.answer(f"{e('calendar')} Введи неделю:")
 
 @router.message(HWStates.add_week)
 async def hw_add_week(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     await state.update_data(week_str=message.text.strip())
     await state.set_state(HWStates.add_content)
     await message.answer(f"{e('write')} Отправь текст или фото (с подписью) для этого ДЗ:")
@@ -768,20 +862,24 @@ async def hw_add_content(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("adm_hw_del_"))
 async def cb_hw_del(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     hid = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM homework WHERE id=?", (hid,))
         await db.commit()
-    await call.answer("Удалено", show_alert=True)
     await render_adm_hw(call)
+    await call.answer("Удалено", show_alert=True)
 
 @router.callback_query(F.data.startswith("adm_hw_"))
 async def cb_hw_view_adm(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    if call.data == "adm_hw_add": return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
+    if call.data == "adm_hw_add":
+        return
     hid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM homework WHERE id=?", (hid,))
         hw = await cur.fetchone()
     if not hw:
@@ -798,7 +896,8 @@ async def cb_hw_view_adm(call: CallbackQuery):
 
 # ============ ADMIN: SUBJECTS ============
 async def render_adm_subjects(call: CallbackQuery):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM subjects ORDER BY name")
         subs = await cur.fetchall()
     kb = [[InlineKeyboardButton(text=f"📚 {s['name']}", callback_data=f"adm_subj_{s['id']}")] for s in subs]
@@ -809,14 +908,16 @@ async def render_adm_subjects(call: CallbackQuery):
 
 @router.callback_query(F.data == "adm_subjects")
 async def cb_adm_subjects(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.clear()
     await render_adm_subjects(call)
     await call.answer()
 
 @router.callback_query(F.data == "adm_subj_add")
 async def cb_subj_add(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     await state.set_state(SubjectStates.add_name)
     await safe_edit(call, f"{e('plus')} Введи название предмета:",
                     InlineKeyboardMarkup(inline_keyboard=[[back_btn("adm_subjects")]]))
@@ -824,7 +925,8 @@ async def cb_subj_add(call: CallbackQuery, state: FSMContext):
 
 @router.message(SubjectStates.add_name)
 async def subj_add(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     name = message.text.strip()
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -838,21 +940,25 @@ async def subj_add(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("adm_subj_del_"))
 async def cb_subj_del(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     sid = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM subjects WHERE id=?", (sid,))
         await db.execute("DELETE FROM gdz WHERE subject_id=?", (sid,))
         await db.commit()
-    await call.answer("Удалено", show_alert=True)
     await render_adm_subjects(call)
+    await call.answer("Удалено", show_alert=True)
 
 @router.callback_query(F.data.startswith("adm_subj_"))
 async def cb_subj_view(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    if call.data == "adm_subj_add": return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
+    if call.data == "adm_subj_add":
+        return
     sid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM subjects WHERE id=?", (sid,))
         s = await cur.fetchone()
     if not s:
@@ -867,7 +973,8 @@ async def cb_subj_view(call: CallbackQuery):
 
 # ============ ADMIN: GDZ CONTENT ============
 async def render_adm_gdz_list(call: CallbackQuery, sid: int):
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM subjects WHERE id=?", (sid,))
         s = await cur.fetchone()
         cur = await db.execute(
@@ -886,8 +993,10 @@ async def render_adm_gdz_list(call: CallbackQuery, sid: int):
 
 @router.callback_query(F.data == "adm_gdz_subjects")
 async def cb_adm_gdz_subjects(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
-    async with await db_connect() as db:
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM subjects ORDER BY name")
         subs = await cur.fetchall()
     kb = [[InlineKeyboardButton(text=f"📚 {s['name']}", callback_data=f"adm_gdz_list_{s['id']}")] for s in subs]
@@ -897,18 +1006,21 @@ async def cb_adm_gdz_subjects(call: CallbackQuery):
     await call.answer()
 
 @router.callback_query(F.data.startswith("adm_gdz_list_"))
-async def cb_adm_gdz_list(call: CallbackQuery, state: FSMContext = None):
-    if not is_admin(call.from_user.id): return
-    if state: await state.clear()
+async def cb_adm_gdz_list(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
+    await state.clear()
     sid = int(call.data.split("_")[-1])
     await render_adm_gdz_list(call, sid)
     await call.answer()
 
 @router.callback_query(F.data.startswith("adm_gdz_add_"))
 async def cb_gdz_add(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     sid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT COUNT(*) c FROM models")
         cnt = (await cur.fetchone())["c"]
     if cnt == 0:
@@ -921,23 +1033,27 @@ async def cb_gdz_add(call: CallbackQuery, state: FSMContext):
 
 @router.message(GDZStates.add_date)
 async def gdz_add_date(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     await state.update_data(date_str=message.text.strip())
     await state.set_state(GDZStates.add_month)
     await message.answer(f"{e('calendar')} Введи месяц:")
 
 @router.message(GDZStates.add_month)
 async def gdz_add_month(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     await state.update_data(month_str=message.text.strip())
     await state.set_state(GDZStates.add_week)
     await message.answer(f"{e('calendar')} Введи неделю:")
 
 @router.message(GDZStates.add_week)
 async def gdz_add_week(message: Message, state: FSMContext):
-    if not message.text: await message.answer("Отправь текст."); return
+    if not message.text:
+        await message.answer("Отправь текст."); return
     await state.update_data(week_str=message.text.strip())
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM models ORDER BY is_recommended DESC, name")
         models = await cur.fetchall()
     models_list = [dict(m) for m in models]
@@ -984,42 +1100,50 @@ async def gdz_model_content(message: Message, state: FSMContext):
 
 @router.callback_query(F.data.startswith("adm_gdz_delgrp_"))
 async def cb_gdz_delgrp(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     gid = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM gdz WHERE id=?", (gid,))
         base = await cur.fetchone()
         if base:
             await db.execute(
                 "DELETE FROM gdz WHERE subject_id=? AND date_str=? AND month_str=? AND week_str=?",
-                (base[1], base[3], base[4], base[5]))
+                (base["subject_id"], base["date_str"], base["month_str"], base["week_str"]))
             await db.commit()
     await call.answer("Удалено", show_alert=True)
     if base:
-        await render_adm_gdz_list(call, base[1])
+        await render_adm_gdz_list(call, base["subject_id"])
 
 @router.callback_query(F.data.startswith("adm_gdz_del_"))
 async def cb_gdz_del(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     gid = int(call.data.split("_")[-1])
     async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT subject_id FROM gdz WHERE id=?", (gid,))
         r = await cur.fetchone()
         await db.execute("DELETE FROM gdz WHERE id=?", (gid,))
         await db.commit()
     await call.answer("Удалено", show_alert=True)
-    if r: await render_adm_gdz_list(call, r[0])
+    if r:
+        await render_adm_gdz_list(call, r["subject_id"])
 
 @router.callback_query(F.data.startswith("adm_gdz_group_"))
 async def cb_gdz_group(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     gid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute("SELECT * FROM gdz WHERE id=?", (gid,))
         base = await cur.fetchone()
     if not base:
         await call.answer("Не найдено", show_alert=True); return
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT g.*, m.name as model_name FROM gdz g "
             "LEFT JOIN models m ON g.model_id=m.id "
@@ -1043,9 +1167,11 @@ async def cb_gdz_group(call: CallbackQuery):
 
 @router.callback_query(F.data.startswith("adm_gdz_item_"))
 async def cb_gdz_item(call: CallbackQuery):
-    if not is_admin(call.from_user.id): return
+    if not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True); return
     gid = int(call.data.split("_")[-1])
-    async with await db_connect() as db:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT g.*, m.name as model_name FROM gdz g "
             "LEFT JOIN models m ON g.model_id=m.id WHERE g.id=?", (gid,))
@@ -1069,15 +1195,18 @@ async def cmd_help(message: Message):
 
 @router.message()
 async def fallback(message: Message, state: FSMContext):
-    if await state.get_state(): return
+    if await state.get_state():
+        return
     await register_user(message.from_user)
     await message.answer("Используй кнопки меню 👇",
-                        reply_markup=main_menu_kb(is_admin(message.from_user.id), False))
+                         reply_markup=main_menu_kb(is_admin(message.from_user.id), False))
 
 # ============ RUN ============
 async def main():
+    # Убираем вебхук и сбрасываем накопившиеся обновления
+    await bot.delete_webhook(drop_pending_updates=True)
     await init_db()
-    logging.info("Bot started")
+    log.info("Bot started (polling)")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
